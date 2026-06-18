@@ -1,0 +1,549 @@
+import logging
+import math
+import re
+import os
+import json
+import requests
+from dataclasses import dataclass
+from typing import Optional, Dict, Any, List
+
+from bs4 import BeautifulSoup
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.constants import ParseMode
+from telegram.ext import (
+    Application, CommandHandler, CallbackQueryHandler,
+    ContextTypes, MessageHandler, filters, ConversationHandler
+)
+
+# ================== برای اینکه سایت github اینو بخونه تنظیمات اصلی ==================
+
+BOT_TOKEN     = os.getenv("TELEGRAM_BOT_TOKEN", "8187715324:AAEfVuuYLNY0l1SuKE-hEJv5uC2wtMuBeok")
+MERCHANT_ID   = os.getenv("MERCHANT_ID", "1253538e-6521-11ea-8511-000c295eb8fc")
+CALLBACK_URL  = os.getenv("CALLBACK_URL", "https://zarinpal.com/zarinpal/callback")
+SUPPORT_PHONE = os.getenv("SUPPORT_PHONE", "+9899397793979")
+SUPPORT_USERNAME = os.getenv("SUPPORT_USERNAME", "@capitan_6ah")
+ADMIN_CHAT_ID = int(os.getenv("ADMIN_CHAT_ID", "162062502"))  # آیدی عددی ادمین
+
+
+# ================== تنظیمات اصلی ==================
+BOT_TOKEN = "8187715324:AAEfVuuYLNY0l1SuKE-hEJv5uC2wtMuBeok"          # ← توکن ربات تلگرام
+MERCHANT_ID = "1253538e-6521-11ea-8511-000c295eb8fc"      # ← مرچنت زرین‌پال
+CALLBACK_URL = "https://zarinpal.com/zarinpal/callback"  # ← لینک بازگشت
+SUPPORT_USERNAME = "@capitan_6ah"          # ← آیدی پشتیبانی (با @)
+SUPPORT_PHONE = "+9899397793979"                      # ← شماره پشتیبانی
+INSTAGRAM_URL = "https://www.instagram.com/zoom_in_games/"     # ← لینک اینستاگرام
+ADMIN_CHAT_ID = 162062502                            # ← آیدی عددی تلگرام ادمین (برای نوتیف سفارش)
+
+# نرخ پیش‌فرض تتر (تومان) اگر API در دسترس نبود
+DEFAULT_USDT_TMN = 165_000
+
+
+# سود (حداقل 5%)
+PROFIT_PERCENT = 5.0 # قابل تغییر با /setprofit ولی هرگز کمتر از 5 اعمال نمی‌کنیم
+
+
+
+# ضریب Liogames
+LIO_MULTIPLIER = 1.0325
+
+# نمایش فقط قیمت تومانی به کاربر (دلار نشان داده نشود)
+SHOW_USD_TO_USER = False
+
+# روش پرداخت: StartPay (استاندارد) یا Payman (پرداخت مستقیم)
+USE_PAYMAN = False  # اگر True کنی، از Payman استفاده می‌شود (پارامترها را پر کن)
+
+# ================== لاگ ==================
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("bazihub-bot")
+
+# ================== مدل محصول ==================
+@dataclass
+class Product:
+    pid: str         # شناسه داخلی ما
+    name: str        # نام نمایش به کاربر
+    liogames_key: str  # عنوانی که در Liogames باید پیدا شود
+    usd_fallback: float  # اگر اسکرپ شکست خورد
+
+# محصولات هدف (مطابق چیزی که گفتی)
+MLBB_PRODUCTS: List[Product] = [
+    Product("156+16",     "MLBB • 172 جم (156+16)",       "Diamond×156 +16",   2.28),
+    Product("234+23",     "MLBB • 257 جم (234+23)",       "Diamond×234 +23",   3.32),
+    Product("625+81",     "MLBB • 706 جم (625+81)",       "Diamond×625 +81",   8.98),
+    Product("1860+335",   "MLBB • 2195 جم (1860+335)",    "Diamond×1860 +335", 27.17),
+    Product("twilight",   "MLBB • Twilight Passage",      "Twilight Passage",  7.15),
+    Product("weekly",     "MLBB • Diamond Weekly Pass",   "Diamond Weekly Pass", 1.39),
+]
+
+# ================== کمک‌تابع‌ها: نرخ و گردکردن ==================
+def ceil_to_1000(value_tmn: float) -> int:
+    """گرد به بالاترین هزار تومان"""
+    return int(math.ceil(value_tmn / 1000.0) * 1000)
+
+def fetch_usdt_rate() -> float:
+    """
+    نرخ لحظه‌ای USDT از Bitpin.
+    کد صحیح: USDT_IRT
+    """
+    try:
+        url = "https://api.bitpin.ir/v1/mkt/markets/"
+        res = requests.get(url, timeout=10)
+        data = res.json()
+        for market in data.get("results", []):
+            if market.get("code") == "USDT_IRT":
+                return float(market["price"])
+    except Exception as e:
+        logger.warning(f"Bitpin fetch failed: {e}")
+    return DEFAULT_USDT_TMN
+
+# ================== اسکرپ قیمت از Liogames ==================
+def fetch_liogames_prices() -> Dict[str, float]:
+    """
+    صفحه Liogames را می‌خوانیم و فقط محصولات هدف را با قیمت دلاری برمی‌گردانیم.
+    خروجی: dict[name -> usd_price]
+    """
+    session = requests.Session()
+    session.headers.update({"User-Agent": "Mozilla/5.0"})
+
+    url = "https://www.liogames.com/product/mobile-legends/"
+    html = session.get(url, timeout=15).text
+    soup = BeautifulSoup(html, "html.parser")
+
+    form_tag = soup.find("form", {"class": "variations_form"})
+    result: Dict[str, float] = {}
+
+    if form_tag and form_tag.has_attr("data-product_variations"):
+        variations_json = form_tag["data-product_variations"]
+        variations = json.loads(variations_json)
+
+        # استخراج کلید attribute (مانند attribute_pa_diamond)
+        attribute_keys = set()
+        for v in variations:
+            attribute_keys.update(v.get("attributes", {}).keys())
+
+        # مپ slug → متن قابل خواندن
+        name_map = {}
+        for select in form_tag.find_all("select"):
+            for opt in select.find_all("option"):
+                if opt.get("value"):
+                    name_map[opt["value"]] = opt.text.strip()
+
+        # محصولات هدف در Liogames
+        target_names = {p.liogames_key for p in MLBB_PRODUCTS}
+
+        for var in variations:
+            attr_value = None
+            for key in attribute_keys:
+                attr_value = var.get("attributes", {}).get(key)
+                if attr_value:
+                    break
+            price = var.get("display_price")
+            name = name_map.get(attr_value, attr_value)
+            if name in target_names and price:
+                # برخی قیمت‌ها ممکن است استرینگ باشند
+                try:
+                    result[name] = float(price)
+                except Exception:
+                    pass
+    else:
+        logger.warning("Liogames JSON of variations not found!")
+
+
+    return result
+
+def get_usd_for_product(liogames_prices: Dict[str, float], liogames_key: str, fallback: float) -> float:
+    """
+    از اسکرپ‌شده‌ها قیمت دلار را می‌گیریم؛ اگر نبود از fallback استفاده می‌کنیم.
+    """
+    usd = liogames_prices.get(liogames_key, fallback)
+    return float(usd)
+
+# ================== محاسبه قیمت نهایی ==================
+def calc_price_tmn_from_usd(product_id: str, usd_price: float, usdt_tmn: float) -> int:
+
+    # ضریب Liogames
+    usd_price = usd_price * LIO_MULTIPLIER
+
+    # سود دلاری محصول
+    usd_price += PROFIT_USD.get(product_id, 0)
+
+    # تبدیل به تومان
+    tmn = usd_price * usdt_tmn
+
+    # گرد به بالاترین هزار تومان
+    return ceil_to_1000(tmn)
+
+# ================== نیک‌نیم MLBB ==================
+def get_mlbb_nickname(user_id: str, zone_id: str) -> Optional[str]:
+    """
+    ابتدا از isan استفاده می‌کنیم؛ اگر نشد از cekidml.
+    """
+    try:
+        url = f"https://api.isan.eu.org/nickname/ml?id={user_id}&zone={zone_id}"
+        r = requests.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=10)
+        if r.status_code == 200:
+            j = r.json()
+            if j.get("success") and j.get("name"):
+                return j["name"]
+    except Exception as e:
+        logger.warning(f"isan nickname failed: {e}")
+
+    try:
+        url = f"https://cekidml.caliph.dev/?id={user_id}&zone={zone_id}"
+        r = requests.get(url, timeout=10)
+        if r.status_code == 200:
+            j = r.json()
+            name = j.get("name") or j.get("nickname")
+            if name:
+                return name
+    except Exception as e:
+        logger.warning(f"cekidml nickname failed: {e}")
+
+    return None
+
+# ================== پرداخت زرین‌پال ==================
+def create_zarinpal_startpay_link(amount_tmn: int, description: str) -> Optional[str]:
+    """
+    ساخت لینک StartPay استاندارد (pg/v4/payment/request.json).
+    amount به تومان است؛ به ریال ارسال می‌کنیم.
+    """
+    url = "https://api.zarinpal.com/pg/v4/payment/request.json"
+    payload = {
+        "merchant_id": MERCHANT_ID,
+        "amount": int(amount_tmn * 10),  # تومان → ریال
+        "callback_url": CALLBACK_URL,
+        "description": description,
+        "metadata": {"mobile": SUPPORT_PHONE, "email": ""},
+    }
+    headers = {"accept": "application/json", "content-type": "application/json"}
+
+    try:
+        resp = requests.post(url, json=payload, headers=headers, timeout=15)
+        j = resp.json()
+        if j.get("data") and j["data"].get("authority"):
+            authority = j["data"]["authority"]  # باید با A شروع شود
+            # ساخت لینک StartPay
+            return f"https://www.zarinpal.com/pg/StartPay/{authority}"
+        else:
+            logger.error(f"Zarinpal StartPay error: {j}")
+    except Exception as e:
+        logger.exception(f"Zarinpal StartPay failed: {e}")
+
+    return None
+
+def create_zarinpal_payman_link(amount_tmn: int, description: str) -> Optional[str]:
+    """
+    پرداخت مستقیم Payman (در صورت نیاز). برای کارکردن واقعی:
+    - باید Payman برای مرچنت شما فعال باشد.
+    - فیلدها را مطابق حساب خودتان تنظیم کنید.
+    خروجی معمولاً یک لینک/کد پرداخت خواهد بود (بسته به پاسخ سرویسی که فعال کرده‌اید).
+    """
+    url = "https://api.zarinpal.com/pg/v4/payman/request.json"
+    payload = {
+        "merchant_id": MERCHANT_ID,
+        # فیلدهای نمونه—حتماً با اطلاعات واقعی جایگزین کنید:
+        "mobile": SUPPORT_PHONE.replace("+98", "0")[:11],  # 0912...
+        "ssn": "0000000000",  # کدملی بر اساس مستندات/حساب شما
+        "expire_at": "2026-01-01 00:00:00",
+        "max_daily_count": "100",
+        "max_monthly_count": "1000",
+        "max_amount": str(int(amount_tmn * 10)),  # ریال
+        "callback_url": CALLBACK_URL,
+        # توضیح سفارش را هم اگر اسکیم سرویس اجازه دهد اضافه کنید (برخی سرویس‌ها فیلد جداگانه دارند)
+        # "description": description,
+    }
+    headers = {"accept": "application/json", "content-type": "application/json"}
+
+    try:
+        resp = requests.post(url, json=payload, headers=headers, timeout=20)
+        j = resp.json()
+        # بسته به پاسخ سرویسی که برای شما فعال شده، باید لینک یا شناسه را از j استخراج کنید.
+        # در اینجا تلاش می‌کنیم چند فیلد متداول را بررسی کنیم.
+        data = j.get("data") or {}
+        link = data.get("link") or data.get("payman_link") or data.get("url")
+        if link:
+            return link
+        # اگر لینک مستقیمی نداد، لاگ بگذار:
+        logger.error(f"Zarinpal Payman response (no link found): {j}")
+    except Exception as e:
+        logger.exception(f"Zarinpal Payman failed: {e}")
+
+    return None
+
+def create_payment_link(amount_tmn: int, description: str) -> Optional[str]:
+    """
+    انتخاب خودکار بین StartPay و Payman بر اساس USE_PAYMAN.
+    """
+    if USE_PAYMAN:
+        link = create_zarinpal_payman_link(amount_tmn, description)
+        if link:
+            return link
+        # اگر Payman جواب نداد، به StartPay برمی‌گردیم:
+        return create_zarinpal_startpay_link(amount_tmn, description)
+    else:
+        return create_zarinpal_startpay_link(amount_tmn, description)
+
+# ================== استیت گفتگو ==================
+ASKING_UID = 1
+
+# ================== منوها ==================
+async def show_main_menu(target):
+    kb = [
+        [InlineKeyboardButton("Mobile Legends: Bang Bang", callback_data="menu_mlbb")],
+        [InlineKeyboardButton("Call of Duty Mobile (به‌زودی)", callback_data="disabled")],
+        [InlineKeyboardButton("PUBG Mobile (به‌زودی)", callback_data="disabled")],
+        [InlineKeyboardButton("📞 پشتیبانی", url=f"https://t.me/{SUPPORT_USERNAME.lstrip('@')}")],
+        [InlineKeyboardButton("📷 اینستاگرام", url=INSTAGRAM_URL)],
+    ]
+    markup = InlineKeyboardMarkup(kb)
+    if hasattr(target, "message") and target.message:
+        await target.message.reply_text("🎮 به BaziHub خوش اومدی! بازی رو انتخاب کن:", reply_markup=markup)
+    else:
+        await target.edit_message_text("🎮 منوی اصلی:", reply_markup=markup)
+
+# ================== هندلر /start ==================
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await show_main_menu(update)
+
+# ================== هندلر کلیک ==================
+async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    data = q.data
+
+    if data == "menu_mlbb":
+        # نرخ تتر
+        usdt = context.application.bot_data.get("usdt_rate") or fetch_usdt_rate()
+        context.application.bot_data["usdt_rate"] = usdt
+
+        # قیمت‌های Liogames
+        liog = fetch_liogames_prices()
+
+        kb = []
+        lines = ["MLBB → یک محصول انتخاب کن:"]
+        
+
+
+
+
+
+for p in MLBB_PRODUCTS:
+            usd = get_usd_for_product(liog, p.liogames_key, p.usd_fallback)
+            price_tmn = calc_price_tmn_from_usd(usd, usdt, PROFIT_PERCENT)
+                  
+            # فقط تومان نشان بده
+            label = f"{p.name} • ~ {price_tmn:,} تومان"
+
+
+
+
+
+
+            kb.append([InlineKeyboardButton(label, callback_data=f"mlbb_{p.pid}")])
+            if SHOW_USD_TO_USER:
+                lines.append(f"- {p.name}: ${usd:.2f} → ~ {price_tmn:,} تومان")
+
+        kb.append([InlineKeyboardButton("⬅️ برگشت", callback_data="back_home")])
+        await q.edit_message_text("\n".join(lines), reply_markup=InlineKeyboardMarkup(kb))
+
+    elif data.startswith("mlbb_"):
+        pid = data.replace("mlbb_", "")
+        prod = next((x for x in MLBB_PRODUCTS if x.pid == pid), None)
+        if not prod:
+            await q.edit_message_text("❌ محصول یافت نشد.")
+            return
+
+        usdt = context.application.bot_data.get("usdt_rate") or fetch_usdt_rate()
+        context.application.bot_data["usdt_rate"] = usdt
+
+        # دریافت دلار از Liogames و محاسبه با ضریب 1.0325 و سود
+        liog = fetch_liogames_prices()
+        usd = get_usd_for_product(liog, prod.liogames_key, prod.usd_fallback)
+       price_tmn = calc_price_tmn_from_usd(usd, usdt, PROFIT_PERCENT)
+             
+
+        # ذخیره برای ادامه
+        context.user_data.update({
+            "product_id": prod.pid,
+            "product_name": prod.name,
+            "usd_price_raw": float(usd),
+            "price_tmn": price_tmn
+        })
+
+        # پیام به کاربر (فقط تومان)
+        text_lines = [
+            f"*{prod.name}*",
+            f"💵 مبلغ نهایی: ~ *{price_tmn:,}* تومان",
+            "",
+            "لطفاً *User ID* و *Zone ID* را به این شکل بفرست:",
+            "`12345678 1234`",
+        ]
+        await q.edit_message_text(
+            "\n".join(text_lines),
+            parse_mode=ParseMode.MARKDOWN,
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ برگشت", callback_data="menu_mlbb")]])
+        )
+        context.user_data["awaiting_mlbb_id"] = True
+
+    elif data == "confirm_pay":
+        ud = context.user_data
+        price_tmn = ud.get("price_tmn")
+        nickname = ud.get("nickname")
+        product_name = ud.get("product_name")
+        user_id = ud.get("user_id")
+        zone_id = ud.get("zone_id")
+
+        if not all([price_tmn, nickname, product_name, user_id, zone_id]):
+            await q.edit_message_text("❌ اطلاعات سفارش ناقص است. دوباره تلاش کنید.")
+            return
+
+        desc = f"{product_name} | UID {user_id} / Zone {zone_id} | Nick: {nickname}"
+        pay_link = create_payment_link(amount_tmn=price_tmn, description=desc)
+        if not pay_link:
+            await q.edit_message_text("❌ خطا در ساخت لینک پرداخت. بعداً تلاش کنید یا با پشتیبانی تماس بگیرید.")
+            return
+
+        await q.edit_message_text(
+            f"✅ تایید شد!\n"
+            f"👤 *{nickname}*\n"
+            f"🛒 *{product_name}*\n"
+            f"💵 مبلغ: *{price_tmn:,}* تومان\n\n"
+            f"🔗 روی دکمه زیر بزن برای پرداخت:",
+            parse_mode=ParseMode.MARKDOWN,
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("💳 پرداخت امن (زرین‌پال)", url=pay_link)]])
+        )
+
+        # پیام به ادمین
+        try:
+            if ADMIN_CHAT_ID:
+                await context.bot.send_message(
+                    chat_id=ADMIN_CHAT_ID,
+                    text=(
+                        "🆕 سفارش جدید\n"
+                        f"کاربر: @{q.from_user.username or q.from_user.id}\n"
+                        f"محصول: {product_name}\n"
+                        f"مبلغ: {price_tmn:,} تومان\n"
+                        f"UID/Zone: {user_id}/{zone_id}\n"
+                        f"Nickname: {nickname}"
+                    )
+                )
+        except Exception as e:
+            logger.warning(f"Admin notify failed: {e}")
+
+        # پاک کردن استیت
+        ud.clear()
+
+    elif data == "cancel_order":
+        context.user_data.clear()
+        await q.edit_message_text("❎ سفارش لغو شد. از منو شروع کن.")
+
+    elif data == "back_home":
+        await show_main_menu(q)
+
+    elif data == "disabled":
+        await q.answer("به‌زودی فعال می‌شود ✅", show_alert=True)
+
+# ================== هندلر متن (گرفتن UID/ZoneID) ==================
+async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if context.user_data.get("awaiting_mlbb_id"):
+        parts = update.message.text.strip().split()
+        if len(parts) != 2 or not all(p.isdigit() for p in parts):
+            await update.message.reply_text(
+                "❗ فرمت درست: `UserID ZoneID` (فقط عدد)\nمثال: `393638382 4050`",
+                parse_mode=ParseMode.MARKDOWN
+            )
+            return
+
+        user_id, zone_id = parts
+        nickname = get_mlbb_nickname(user_id, zone_id)
+        if not nickname:
+            await update.message.reply_text("❌ اکانت یافت نشد یا موقتاً در دسترس نیست. دوباره امتحان کن.")
+            return
+
+        context.user_data["user_id"] = user_id
+        context.user_data["zone_id"] = zone_id
+        context.user_data["nickname"] = nickname
+        context.user_data["awaiting_mlbb_id"] = False
+
+        price_tmn = context.user_data.get("price_tmn")
+        product_name = context.user_data.get("product_name")
+
+        kb = [
+            [InlineKeyboardButton("✅ تایید و ادامه به پرداخت", callback_data="confirm_pay")],
+            [InlineKeyboardButton("❌ لغو", callback_data="cancel_order")],
+        ]
+        await update.message.reply_text(
+            f"👤 *{nickname}*\n"
+            f"🛒 *{product_name}*\n"
+            f"💵 مبلغ: *{price_tmn:,}* تومان\n\n"
+            "آیا تایید می‌کنی؟",
+            parse_mode=ParseMode.MARKDOWN,
+            reply_markup=InlineKeyboardMarkup(kb)
+        )
+
+# ================== دستورات مدیریتی ==================
+async def cmd_usdt(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    rate = context.application.bot_data.get("usdt_rate") or fetch_usdt_rate()
+    context.application.bot_data["usdt_rate"] = rate
+    await update.message.reply_text(f"💲 نرخ فعلی تتر: {rate:,.0f} تومان")
+
+async def cmd_setrate(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.args:
+        await update.message.reply_text("استفاده: /setrate 150000")
+        return
+    try:
+        rate = float(context.args[0])
+        context.application.bot_data["usdt_rate"] = rate
+        await update.message.reply_text(f"✅ نرخ تتر روی {rate:,.0f} تومان تنظیم شد.")
+    except ValueError:
+        await update.message.reply_text("❌ لطفاً عدد معتبر وارد کن.")
+
+async def cmd_setprofit(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    global PROFIT_PERCENT
+    if not context.args:
+        await update.message.reply_text(f"📊 سود فعلی: {PROFIT_PERCENT:.2f}%\nاستفاده: /setprofit 6.5")
+        return
+    try:
+        val = float(context.args[0])
+        PROFIT_PERCENT = max(5.0, val)  # حداقل ۵٪
+        await update.message.reply_text(f"✅ سود روی {PROFIT_PERCENT:.2f}% تنظیم شد (حداقل ۵٪).")
+    except ValueError:
+        await update.message.reply_text("❌ لطفاً عدد معتبر وارد کن.")
+
+async def cmd_setadmin(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # کاربر فعلی را به عنوان ادمین ذخیره می‌کنیم
+    global ADMIN_CHAT_ID
+    ADMIN_CHAT_ID = update.effective_user.id
+    await update.message.reply_text(f"✅ ادمین ثبت شد: {ADMIN_CHAT_ID}")
+
+# ================== جاب آپدیت نرخ ==================
+async def job_update_usdt_rate(context: ContextTypes.DEFAULT_TYPE):
+    rate = fetch_usdt_rate()
+    context.application.bot_data["usdt_rate"] = rate
+    logger.info(f"USDT updated: {rate}")
+
+# ================== main ==================
+def main():
+    app = Application.builder().token(BOT_TOKEN).build()
+
+    # هندلرها
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("usdt", cmd_usdt))
+    app.add_handler(CommandHandler("setrate", cmd_setrate))
+    app.add_handler(CommandHandler("setprofit", cmd_setprofit))
+    app.add_handler(CommandHandler("setadmin", cmd_setadmin))
+
+    app.add_handler(CallbackQueryHandler(on_callback))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
+
+    # مقداردهی اولیه نرخ
+    app.bot_data["usdt_rate"] = fetch_usdt_rate() or DEFAULT_USDT_TMN
+
+    # آپدیت دوره‌ای نرخ (هر ۶۰ ثانیه)
+    if app.job_queue:
+        app.job_queue.run_repeating(job_update_usdt_rate, interval=60, first=5)
+
+    logger.info("🤖 Bot is running ...")
+    app.run_polling()
+
+if __name__ == "__main__":
+    main()

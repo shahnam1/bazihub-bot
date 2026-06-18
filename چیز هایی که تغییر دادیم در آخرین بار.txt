@@ -1,0 +1,22 @@
+async def cmd_setprofit(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    global PROFIT_PERCENT
+    if not context.args:
+        await update.message.reply_text(f"📊 سود فعلی: {PROFIT_PERCENT:.2f}%\nاستفاده: /setprofit 6.5")
+        return
+    try:
+        val = float(context.args[0])
+        PROFIT_PERCENT = max(5.0, val)  # حداقل ۵٪
+        await update.message.reply_text(f"✅ سود روی {PROFIT_PERCENT:.2f}% تنظیم شد (حداقل ۵٪).")
+    except ValueError:
+        await update.message.reply_text("❌ لطفاً عدد معتبر وارد کن.")
+
+price_tmn = calc_price_tmn_from_usd(p.pid,usd,usdt)
+
+for p in MLBB_PRODUCTS:
+            usd = get_usd_for_product(liog, p.liogames_key, p.usd_fallback)
+           # price_tmn = calc_price_tmn_from_usd(usd, usdt, PROFIT_PERCENT)
+                   price_tmn = calc_price_tmn_from_usd(p.pid,usd,usdt)
+            # فقط تومان نشان بده
+            label = f"{p.name} • ~ {price_tmn:,} تومان"
+
+1253538e-6521-11ea-8511-000c295eb8fc

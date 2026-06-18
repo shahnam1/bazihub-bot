@@ -1,0 +1,22 @@
+services:
+  - type: worker
+    name: bazihub-bot
+    env: python
+    region: frankfurt
+    buildCommand: "pip install -r requirements.txt"
+    startCommand: "python bot.py"
+    envVars:
+      - key: BOT_TOKEN
+        sync: false
+      - key: ZARINPAL_MERCHANT_ID
+        sync: false
+      - key: SUPPORT_PHONE
+        sync: false
+      - key: SUPPORT_USERNAME
+        sync: false
+      - key: ADMIN_CHAT_ID
+        sync: false
+      - key: CALLBACK_URL
+        sync: false
+      - key: PROFIT_PERCENT
+        value: "5"   # حداقل سود
