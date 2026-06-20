@@ -4,6 +4,7 @@ import re
 import os
 import json
 import requests
+import requests as _requests
 from dataclasses import dataclass
 from typing import Optional, Dict, Any, List
 
@@ -43,12 +44,12 @@ LIO_MULTIPLIER = 1.0325
 # سود متغیر برای هر محصول (از کم‌ترین به بیشترین)
 # ✅ اصلاح: دیکشنری درست برای سود هر محصول
 PROFIT_USD_MAP = {
-    "156+16": 0.15,      # محصول 1 (ارزونترین)
+    "156+16": 0.35,      # محصول 1 (ارزونترین)
     "234+23": 0.625,     # محصول 2
     "625+81": 0.9,       # محصول 3
     "1860+335": 1.175,   # محصول 4
     "twilight": 1.25,    # محصول 5
-    "weekly": 0.4,       # محصول 6
+    "weekly": 0.15,       # محصول 6
 }
 
 # نمایش فقط قیمت تومانی به کاربر (دلار نشان داده نشود)
@@ -533,9 +534,21 @@ async def job_update_usdt_rate(context: ContextTypes.DEFAULT_TYPE):
     rate = fetch_usdt_rate()
     context.application.bot_data["usdt_rate"] = rate
     logger.info(f"USDT updated: {rate}")
-
+#=====================================================
+def ensure_no_webhook(bot_token: str):
+    try:
+        gw = _requests.get(f"https://api.telegram.org/bot{bot_token}/getWebhookInfo", timeout=10).json()
+        url = gw.get("result", {}).get("url")
+        if url:
+            # حذف وبهوک و پاک کردن آپدیت‌های معلق تا polling کار کند
+            _requests.get(f"https://api.telegram.org/bot{bot_token}/deleteWebhook?drop_pending_updates=true", timeout=10)
+            logger.info("Existing webhook removed to allow polling (deleteWebhook called).")
+    except Exception as e:
+        logger.warning(f"Could not check/delete webhook before polling: {e}")
 # ================== main ==================
 def main():
+    # حذف وبهوک اگر ست شده تا از Conflict جلوگیری شود
+    ensure_no_webhook(BOT_TOKEN)
     app = Application.builder().token(BOT_TOKEN).build()
 
     # هندلرها
